@@ -1,0 +1,10 @@
+title       = "ali1688"
+baseURL     = "https://ali1688-cli.tamnd.com/"
+description = "Browse 1688.com wholesale products"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/ali1688-cli"
