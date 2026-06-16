@@ -3,171 +3,168 @@ package ali1688
 import (
 	"context"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes ali1688 as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/ali1688-cli/ali1688"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// ali1688:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone ali1688 binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the ali1688 driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the 1688.com kit driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme and identity for the ali1688 driver.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "ali1688",
-		Hosts:  []string{Host},
+		Hosts:  []string{Host, SearchHost, DetailHost},
 		Identity: kit.Identity{
 			Binary: "ali1688",
 			Short:  "Browse 1688.com wholesale products",
-			Long: `Browse 1688.com wholesale products
+			Long: `ali1688 reads public 1688.com data over HTTPS.
 
-ali1688 reads public ali1688 data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+NOTE: 1688.com blocks datacenter IPs with anti-bot checks. Commands exit 5
+when the block fires. Run from a residential or mobile IP for best results.
+
+Quick start:
+  ali1688 search laptop             search wholesale laptops
+  ali1688 search phone --min-price 50 --max-price 200
+  ali1688 product 789123456         product details by offer ID`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/ali1688-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and the two operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `ali1688 page` and
-	// `ant get ali1688://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "catalog",
+		Summary: "Search wholesale products on 1688.com",
+		Args:    []kit.Arg{{Name: "query", Help: "search keywords"}},
+	}, searchOp)
 
-	// List op: members of a page, the home of `ali1688 links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// ali1688://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:     "product",
+		Group:    "catalog",
+		Single:   true,
+		Resolver: true,
+		URIType:  "product",
+		Summary:  "Fetch product details by offer ID",
+		Args:     []kit.Arg{{Name: "id", Help: "1688 offer ID (numeric)"}},
+	}, productOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := NewClient(DefaultConfig())
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		c.cfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		c.cfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		c.cfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.cfg.Timeout = cfg.Timeout
+		c.http.Timeout = cfg.Timeout
 	}
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type searchInput struct {
+	Query    string  `kit:"arg" help:"search keywords"`
+	MinPrice float64 `kit:"flag" name:"min-price" help:"minimum price (CNY)"`
+	MaxPrice float64 `kit:"flag" name:"max-price" help:"maximum price (CNY)"`
+	Limit    int     `kit:"flag,inherit" help:"max results"`
+	Client   *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type productInput struct {
+	ID     string  `kit:"arg" help:"1688 offer ID"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchOp(ctx context.Context, in searchInput, emit func(*SearchResult) error) error {
+	results, err := in.Client.Search(ctx, in.Query, SearchOptions{
+		MinPrice: in.MinPrice,
+		MaxPrice: in.MaxPrice,
+		Limit:    in.Limit,
+	})
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range results {
+		if err := emit(&results[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func productOp(ctx context.Context, in productInput, emit func(*Product) error) error {
+	p, err := in.Client.GetProduct(ctx, in.ID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(p)
+}
 
-// Classify turns any accepted input — a bare path or a full ali1688.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// --- Resolver ---
+
+var (
+	offerIDFromPathRE = regexp.MustCompile(`/offer/(\d+)\.html`)
+	bareNumericRE     = regexp.MustCompile(`^\d+$`)
+)
+
+// Classify turns an offer URL or bare numeric ID into (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized ali1688 reference: %q", input)
+	if u, err2 := url.Parse(input); err2 == nil &&
+		(u.Scheme == "http" || u.Scheme == "https") {
+		if m := offerIDFromPathRE.FindStringSubmatch(u.Path); m != nil {
+			return "product", m[1], nil
+		}
 	}
-	return "page", id, nil
+	if bareNumericRE.MatchString(strings.TrimSpace(input)) {
+		return "product", strings.TrimSpace(input), nil
+	}
+	return "", "", errs.Usage("unrecognized 1688 reference: %q", input)
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns the canonical HTTPS URL for (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("ali1688 has no resource type %q", uriType)
+	switch uriType {
+	case "product":
+		return BaseDetailURL + "/offer/" + id + ".html", nil
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	return "", errs.Usage("ali1688 has no resource type %q", uriType)
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts library errors to kit error kinds with the right exit codes.
 func mapErr(err error) error {
+	switch {
+	case isBlockedErr(err):
+		return errs.RateLimited("%s", err.Error())
+	case isNotFoundErr(err):
+		return errs.NotFound("%s", err.Error())
+	}
 	return err
+}
+
+func isBlockedErr(err error) bool {
+	return err != nil && (err == ErrBlocked || strings.Contains(err.Error(), "blocked"))
+}
+
+func isNotFoundErr(err error) bool {
+	return err == ErrNotFound
 }
